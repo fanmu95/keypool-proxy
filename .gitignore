@@ -1,0 +1,10 @@
+# secrets / local config — never commit
+keys.json
+*.bak
+
+# local temp artifacts
+_*.txt
+_uitest/
+_uitest.log
+node_modules/
+.git/
