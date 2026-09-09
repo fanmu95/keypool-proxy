@@ -2239,7 +2239,12 @@ function start() {
 
   const proxyServer = http.createServer(handleProxy);
   proxyServer.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      log('INFO: 端口 ' + proxyPort + ' 已被占用 —— 已有实例在运行，服务不受影响，本次启动退出');
+      process.exit(0);
+    }
     log('FATAL: Proxy server error: ' + e.message);
+    process.exit(1);
   });
   proxyServer.listen(proxyPort, '127.0.0.1', () => {
     log('Proxy server started on 127.0.0.1:' + proxyPort);
@@ -2253,6 +2258,10 @@ function start() {
 
   const manageServer = http.createServer(handleManage);
   manageServer.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      log('INFO: 管理端口 ' + managePort + ' 已被占用 —— 已有实例在运行，服务不受影响，本次启动退出');
+      process.exit(0);
+    }
     log('FATAL: Manage server error: ' + e.message);
   });
   manageServer.listen(managePort, '127.0.0.1', () => {
