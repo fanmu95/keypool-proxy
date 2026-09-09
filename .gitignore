@@ -1,5 +1,5 @@
 # secrets / local config — never commit
-keys.json
+# keys.json is intentionally committed (baked into the image, private repo)
 *.bak
 
 # local temp artifacts

@@ -1,0 +1,105 @@
+{
+  "providers": {
+    "tokenrhythm": {
+      "name": "TokenRhythm",
+      "targetUrl": "https://tokenrhythm.studio",
+      "prefix": "/tr",
+      "keys": [
+        "sk_tr_ZcPgHmy_BVDuxZi7gJG6O2PYmSwQd8X7nxpyL4dD_iM",
+        {
+          "key": "sk_tr_edkY2RbJkF2I12n_GAGw2Svw1_jjOhHihQoGIiY3d1A",
+          "weight": 1
+        }
+      ],
+      "modelOverrides": {
+        "glm-5": "ultra",
+        "glm-5.1": "ultra",
+        "minimax-m2.7": "ultra",
+        "kimi-k2.5": "ultra",
+        "kimi-k2.6": "ultra",
+        "minimax-m2.5": "ultra",
+        "mimo-v2.5-pro": "ultra",
+        "qwen3.7-max": "ultra",
+        "kimi-k2.7-code": "ultra",
+        "glm-5.2": "ultra",
+        "qwen3.8-max": "ultra",
+        "deepseek-v4-flash-0731": "max",
+        "seed-2.1-turbo": "ultra",
+        "seed-2.1-pro": "ultra",
+        "deepseek-v4-pro-0813": "max",
+        "glm-5.3": "ultra",
+        "qwen3.7-flash": "ultra",
+        "qwen3.8-27b": "ultra",
+        "longcat-2.0": "ultra",
+        "glm-5.3-flash": "ultra",
+        "qwen3.8-flash": "ultra",
+        "deepseek-v4.1-flash-expires-on-0910": "max"
+      },
+      "disabledModels": {
+        "glm-5.1": true,
+        "glm-5": true,
+        "kimi-k2.5": true,
+        "minimax-m2.7": true,
+        "kimi-k2.6": true,
+        "minimax-m2.5": true,
+        "mimo-v2.5-pro": true,
+        "qwen3.7-max": true,
+        "glm-5.2": true,
+        "kimi-k2.7-code": true,
+        "qwen3.8-max": true,
+        "seed-2.1-turbo": true,
+        "seed-2.1-pro": true,
+        "glm-5.3": true,
+        "deepseek-v4-pro-0813": true,
+        "qwen3.7-flash": true,
+        "qwen3.8-27b": true,
+        "longcat-2.0": true,
+        "qwen3.8-flash": true
+      }
+    },
+    "sensenova": {
+      "name": "SenseNova",
+      "targetUrl": "https://token.sensenova.cn",
+      "prefix": "/sn",
+      "keys": [
+        "sk-36CMPiMOrAyGqlyzoXbiYSs1ZwCdYIfy",
+        "sk-yDfprnQyO2BmVj2A64CvuzHZrPheJ8lT",
+        "sk-3N9FbZHIsQqgZO9gcDTo2lCdm9g96ezG",
+        "sk-BwEZuqUNWxOgpdgkOjPBh4xoHoYPtRa9",
+        {
+          "key": "sk-9IiZaI8ayBhcbYw3tmHDR1qKwl2pdsU5",
+          "weight": 1
+        },
+        {
+          "key": "sk-UkH9OI2vlMfwFRZCFwciSbhwRvFNZSWu",
+          "weight": 1
+        }
+      ],
+      "modelOverrides": {
+        "glm-5.2": "max",
+        "deepseek-v4-flash": "xhigh",
+        "kimi-k3": "max",
+        "sensenova-6.8-flash-lite": "xhigh",
+        "sensenova-6.7-flash-lite": "none",
+        "sensenova-u1-fast": "none",
+        "sensenova-u1.5-lite": "none",
+        "deepseek-v4-pro": "max"
+      }
+    }
+  },
+  "maxRetries": 999,
+  "retryDelay": 0,
+  "requestTimeout": 15000,
+  "overallTimeout": 120000,
+  "circuitBreaker": 999,
+  "mode": "normal",
+  "cooldown429": 5,
+  "raceMode": false,
+  "raceMinRetryDelay": 100,
+  "raceCircuitBreaker": 999,
+  "raceRounds": 3,
+  "roundDelay": 1000,
+  "port": 9119,
+  "managePort": 9120,
+  "accessKey": "Zxcvbnm123."
+}

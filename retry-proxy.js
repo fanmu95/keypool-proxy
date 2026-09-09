@@ -8,7 +8,7 @@ const path = require('path');
 const url = require('url');
 
 // ─── Paths ───
-const KEYS_FILE = path.join(__dirname, 'keys.json');
+const KEYS_FILE = process.env.KEYS_FILE || path.join(__dirname, 'keys.json');
 
 // ─── State ───
 let config = loadConfig();
@@ -2251,6 +2251,9 @@ function start() {
   const proxyPort = config.port || 9119;
   const managePort = config.managePort || 9120;
 
+  // Bind address: 127.0.0.1 locally; containers set HOST=0.0.0.0 so port
+  // mappings can reach the service (loopback is unreachable through -p mapping).
+  const BIND_HOST = process.env.HOST || '127.0.0.1';
   const proxyServer = http.createServer((req, res) => {
     handleProxy(req, res).catch((e) => {
       // A single bad request must never kill the gateway process.
@@ -2271,7 +2274,7 @@ function start() {
     log('FATAL: Proxy server error: ' + e.message);
     process.exit(1);
   });
-  proxyServer.listen(proxyPort, '127.0.0.1', () => {
+  proxyServer.listen(proxyPort, BIND_HOST, () => {
     log('Proxy server started on 127.0.0.1:' + proxyPort);
     log('  retryDelay=' + (config.retryDelay || 0) + 'ms requestTimeout=' + (config.requestTimeout || 30000) + 'ms maxRetries=' + (config.maxRetries || 10));
     for (const pid in config.providers) {
@@ -2299,7 +2302,7 @@ function start() {
     }
     log('FATAL: Manage server error: ' + e.message);
   });
-  manageServer.listen(managePort, '127.0.0.1', () => {
+  manageServer.listen(managePort, BIND_HOST, () => {
     log('Management UI started on http://127.0.0.1:' + managePort);
   });
 
