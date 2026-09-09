@@ -1983,11 +1983,12 @@ function renderModelCards(d) {
     const folded = collapsedUI['models|' + pid] !== false;   // default: folded
     const job = allProbe[pid];
     const jobActive = job && (job.running || (job.total > 0 && job.done < job.total && !job.error && job.done > 0));
+    // Disabled count must be computed for EVERY render path (head uses it)
+    const offCount = Array.isArray(ids) ? ids.filter(m => p.disabledModels && p.disabledModels[m]).length : 0;
     let rows = '';
     if (ids === 'loading') {
       rows = '<div class="empty">模型列表加载中…</div>';
     } else if (Array.isArray(ids) && ids.length) {
-      const offCount = ids.filter(m => d.providers[pid].disabledModels && d.providers[pid].disabledModels[m]).length;
       for (const mid of ids) {
         const key = pid + '|' + mid;
         const ov = ovs[mid];
