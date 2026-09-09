@@ -4,6 +4,9 @@ FROM node:20-alpine
 
 # Bind all interfaces so docker -p port mappings can reach the service
 ENV HOST=0.0.0.0
+# Logs show Beijing time
+ENV TZ=Asia/Shanghai
+RUN apk add --no-cache tzdata
 
 WORKDIR /app
 
