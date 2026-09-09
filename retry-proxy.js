@@ -19,12 +19,15 @@ let recentLogs = [];     // ring buffer of recent log lines
 const MAX_LOGS = 200;
 
 // ─── Logging ───
+const LOG_FILE = path.join(__dirname, 'proxy.log');
 function log(msg) {
   const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const line = `[${ts}] ${msg}`;
   console.log(line);
   recentLogs.push(line);
   if (recentLogs.length > MAX_LOGS) recentLogs.shift();
+  // Persist to disk so a crash leaves evidence (sync: tiny volume, always survives)
+  try { fs.appendFileSync(LOG_FILE, line + '\n', 'utf8'); } catch (e) { /* never break on logging */ }
 }
 
 function loadConfig() {
@@ -2231,13 +2234,34 @@ setInterval(loadStatus, 3000);
 </html>
 `;
 
+// ─── Process-level safety net ───
+// The gateway must stay alive: a stray callback error or an unhandled
+// rejection gets logged (with stack) instead of silently killing the process.
+process.on('uncaughtException', (e) => {
+  log('UNCAUGHT-EXCEPTION: ' + ((e && e.stack) || e));
+});
+process.on('unhandledRejection', (r) => {
+  log('UNHANDLED-REJECTION: ' + ((r && (r.stack || r.message)) || r));
+});
+
 // ─── Start servers ───
 function start() {
   reloadConfig();
   const proxyPort = config.port || 9119;
   const managePort = config.managePort || 9120;
 
-  const proxyServer = http.createServer(handleProxy);
+  const proxyServer = http.createServer((req, res) => {
+    handleProxy(req, res).catch((e) => {
+      // A single bad request must never kill the gateway process.
+      log('PROXY-ERROR: ' + ((e && e.stack) || e));
+      try {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'internal error: ' + e.message }));
+        }
+      } catch (_) { /* socket already gone */ }
+    });
+  });
   proxyServer.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
       log('INFO: 端口 ' + proxyPort + ' 已被占用 —— 已有实例在运行，服务不受影响，本次启动退出');
@@ -2256,7 +2280,17 @@ function start() {
     }
   });
 
-  const manageServer = http.createServer(handleManage);
+  const manageServer = http.createServer((req, res) => {
+    handleManage(req, res).catch((e) => {
+      log('MGR-ERROR: ' + ((e && e.stack) || e));
+      try {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'internal error: ' + e.message }));
+        }
+      } catch (_) { /* socket already gone */ }
+    });
+  });
   manageServer.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
       log('INFO: 管理端口 ' + managePort + ' 已被占用 —— 已有实例在运行，服务不受影响，本次启动退出');
