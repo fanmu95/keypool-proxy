@@ -8,3 +8,4 @@ _uitest/
 _uitest.log
 node_modules/
 .git/
+*.log

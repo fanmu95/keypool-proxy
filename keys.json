@@ -84,6 +84,10 @@
         "sensenova-u1-fast": "none",
         "sensenova-u1.5-lite": "none",
         "deepseek-v4-pro": "max"
+      },
+      "disabledModels": {
+        "sensenova-6.7-flash-lite": true,
+        "sensenova-u1-fast": true
       }
     }
   },
