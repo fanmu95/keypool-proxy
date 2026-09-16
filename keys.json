@@ -1,62 +1,5 @@
 {
   "providers": {
-    "tokenrhythm": {
-      "name": "TokenRhythm",
-      "targetUrl": "https://tokenrhythm.studio",
-      "prefix": "/tr",
-      "keys": [
-        "sk_tr_ZcPgHmy_BVDuxZi7gJG6O2PYmSwQd8X7nxpyL4dD_iM",
-        {
-          "key": "sk_tr_edkY2RbJkF2I12n_GAGw2Svw1_jjOhHihQoGIiY3d1A",
-          "weight": 1
-        }
-      ],
-      "modelOverrides": {
-        "glm-5": "ultra",
-        "glm-5.1": "ultra",
-        "minimax-m2.7": "ultra",
-        "kimi-k2.5": "ultra",
-        "kimi-k2.6": "ultra",
-        "minimax-m2.5": "ultra",
-        "mimo-v2.5-pro": "ultra",
-        "qwen3.7-max": "ultra",
-        "kimi-k2.7-code": "ultra",
-        "glm-5.2": "ultra",
-        "qwen3.8-max": "ultra",
-        "deepseek-v4-flash-0731": "max",
-        "seed-2.1-turbo": "ultra",
-        "seed-2.1-pro": "ultra",
-        "deepseek-v4-pro-0813": "max",
-        "glm-5.3": "ultra",
-        "qwen3.7-flash": "ultra",
-        "qwen3.8-27b": "ultra",
-        "longcat-2.0": "ultra",
-        "glm-5.3-flash": "ultra",
-        "qwen3.8-flash": "ultra",
-        "deepseek-v4.1-flash-expires-on-0910": "max"
-      },
-      "disabledModels": {
-        "glm-5.1": true,
-        "glm-5": true,
-        "kimi-k2.5": true,
-        "minimax-m2.7": true,
-        "kimi-k2.6": true,
-        "minimax-m2.5": true,
-        "mimo-v2.5-pro": true,
-        "qwen3.7-max": true,
-        "glm-5.2": true,
-        "kimi-k2.7-code": true,
-        "qwen3.8-max": true,
-        "seed-2.1-turbo": true,
-        "seed-2.1-pro": true,
-        "glm-5.3": true,
-        "deepseek-v4-pro-0813": true,
-        "qwen3.7-flash": true,
-        "qwen3.8-27b": true,
-        "longcat-2.0": true,
-        "qwen3.8-flash": true
-      }
-    },
     "sensenova": {
       "name": "SenseNova",
       "targetUrl": "https://token.sensenova.cn",
@@ -88,13 +31,70 @@
       "disabledModels": {
         "sensenova-6.7-flash-lite": true,
         "sensenova-u1-fast": true
+      },
+      "autoProbeEffort": true
+    },
+    "workbuddygj": {
+      "name": "workBuddyGJ",
+      "targetUrl": "http://127.0.0.1:8789",
+      "prefix": "/wbgj",
+      "keys": [
+        {
+          "key": "1",
+          "weight": 1
+        }
+      ],
+      "modelOverrides": {
+        "default-model": "ultra",
+        "fast-model": "ultra",
+        "balanced-model": "ultra",
+        "primary-model": "ultra",
+        "deep-model": "ultra",
+        "hy4-preview-f": "ultra",
+        "hy3": "ultra",
+        "deepseek-v4.1-flash": "high",
+        "gpt-6-astra": "ultra",
+        "gpt-5.6-sol": "ultra",
+        "gpt-5.6-terra": "ultra",
+        "gpt-5.6-luna": "ultra",
+        "gpt-5.5": "ultra",
+        "gpt-5.4": "ultra",
+        "gpt-5.3-codex": "ultra",
+        "gemini-3.5-flash": "ultra",
+        "glm-5.3": "ultra",
+        "glm-5.2": "ultra",
+        "kimi-k3": "ultra",
+        "kimi-k2.6": "ultra"
+      },
+      "autoRefreshModels": true,
+      "autoProbeEffort": false,
+      "disabledModels": {
+        "fast-model": true,
+        "default-model": true,
+        "balanced-model": true,
+        "primary-model": true,
+        "deep-model": true,
+        "hy4-preview-f": true,
+        "hy3": true,
+        "gpt-6-astra": true,
+        "gpt-5.6-sol": true,
+        "gpt-5.6-terra": true,
+        "gpt-5.6-luna": true,
+        "gpt-5.5": true,
+        "gpt-5.3-codex": true,
+        "gemini-3.5-flash": true,
+        "gpt-5.4": true,
+        "glm-5.3": true,
+        "kimi-k3": true,
+        "glm-5.2": true,
+        "kimi-k2.6": true
       }
     }
   },
-  "maxRetries": 999,
+  "maxRetries": 20,
   "retryDelay": 0,
-  "requestTimeout": 15000,
-  "overallTimeout": 120000,
+  "requestTimeout": 60000,
+  "overallTimeout": 300000,
   "circuitBreaker": 999,
   "mode": "normal",
   "cooldown429": 5,

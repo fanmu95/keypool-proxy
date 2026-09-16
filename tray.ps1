@@ -37,8 +37,10 @@ function Find-Node {
 $nodeExe = Find-Node
 if (-not $nodeExe) { Write-Host "WARNING: node.exe not found in any known location" }
 $proxyScript = Join-Path $proxyDir "retry-proxy.js"
+$adapterScript = Join-Path $proxyDir "responses-adapter.js"
 $manageUrl = "http://127.0.0.1:9120"
 $proxyPort = 9119
+$adapterPort = 9189
 $modelsJson = "C:\Users\55007\.workbuddy\models.json"
 
 # ─── Switch models.json between proxy URLs and direct URLs ───
@@ -109,40 +111,73 @@ $notify.Visible = $true
 # Track proxy process
 $proxyProcess = $null
 $proxyRunning = $false
+$adapterRunning = $false
 
-# ─── Check if proxy port is actually listening (survives external starts) ───
-function Test-ProxyPort {
-    $conn = Get-NetTCPConnection -LocalPort $proxyPort -State Listen -ErrorAction SilentlyContinue
+# ─── Check if a port is listening (survives external starts) ───
+function Test-PortListening {
+    param([int]$Port)
+    $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
     return ($null -ne $conn)
 }
 
+function Test-ProxyPort { return (Test-PortListening -Port $proxyPort) }
+
 function Update-IconStatus {
-    $script:proxyRunning = Test-ProxyPort
-    if ($script:proxyRunning) {
+    $script:proxyRunning = Test-PortListening -Port $proxyPort
+    $script:adapterRunning = Test-PortListening -Port $adapterPort
+    if ($script:proxyRunning -and $script:adapterRunning) {
         $script:notify.Icon = $iconGreen
-        $script:notify.Text = "Key Pool Proxy (Running) - :$proxyPort"
+        $script:notify.Text = "Key Pool Proxy (Running) - :$proxyPort + :$adapterPort"
+    } elseif ($script:proxyRunning -or $script:adapterRunning) {
+        $script:notify.Icon = $iconRed
+        $part = if ($script:proxyRunning) { ":$proxyPort 运行 / :$adapterPort 停止" } else { ":$proxyPort 停止 / :$adapterPort 运行" }
+        $script:notify.Text = "Key Pool Proxy (Partial) - $part"
     } else {
         $script:notify.Icon = $iconRed
         $script:notify.Text = "Key Pool Proxy (Stopped)"
     }
-    $script:itemStart.Enabled = -not $script:proxyRunning
-    $script:itemStop.Enabled = $script:proxyRunning
+    $script:itemStart.Enabled = -not ($script:proxyRunning -and $script:adapterRunning)
+    $script:itemStop.Enabled = ($script:proxyRunning -or $script:adapterRunning)
+    if ($script:itemRestart) { $script:itemRestart.Enabled = ($script:proxyRunning -or $script:adapterRunning) }
+}
+
+function Start-Adapter {
+    if ($script:adapterRunning) { return }
+    if (-not $nodeExe) { return }
+    if (-not (Test-Path $adapterScript)) {
+        Write-Host "WARNING: $adapterScript not found, adapter not started"
+        return
+    }
+    Start-Process -FilePath $nodeExe -ArgumentList "`"$adapterScript`"" -WindowStyle Hidden
+    Start-Sleep -Milliseconds 800
+    Write-Host "Adapter start requested (: $adapterPort, hidden window)"
+}
+
+function Stop-Adapter {
+    $conns = Get-NetTCPConnection -LocalPort $adapterPort -State Listen -ErrorAction SilentlyContinue
+    foreach ($c in $conns) {
+        Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 300
+    Write-Host "Adapter stopped"
 }
 
 function Start-Proxy {
     param($nodeExe, $proxyScript)
-    if ($script:proxyRunning) { return }
     if (-not $nodeExe) {
         $script:notify.ShowBalloonTip(6000, "Key Pool Proxy", "找不到 node.exe，无法启动代理", [System.Windows.Forms.ToolTipIcon]::Error)
         Write-Host "ERROR: node.exe not found, cannot start proxy"
         return
     }
-    # Launch node with FULLY HIDDEN window (no taskbar icon, no console flash)
-    Start-Process -FilePath $nodeExe -ArgumentList "`"$proxyScript`"" -WindowStyle Hidden
-    Start-Sleep -Milliseconds 800
-    Switch-ModelsJson -toProxy $true
+    if (-not $script:proxyRunning) {
+        # Launch node with FULLY HIDDEN window (no taskbar icon, no console flash)
+        Start-Process -FilePath $nodeExe -ArgumentList "`"$proxyScript`"" -WindowStyle Hidden
+        Start-Sleep -Milliseconds 800
+        Switch-ModelsJson -toProxy $true
+    }
+    Start-Adapter
     Update-IconStatus
-    Write-Host "Proxy start requested (hidden window)"
+    Write-Host "Proxy + adapter start requested (hidden window)"
 }
 
 function Stop-Proxy {
@@ -153,8 +188,17 @@ function Stop-Proxy {
     }
     Start-Sleep -Milliseconds 500
     Switch-ModelsJson -toProxy $false
+    Stop-Adapter
     Update-IconStatus
-    Write-Host "Proxy stopped"
+    Write-Host "Proxy + adapter stopped"
+}
+
+function Restart-Proxy {
+    Write-Host "Restarting proxy + adapter..."
+    Stop-Proxy
+    Start-Sleep -Milliseconds 700
+    Start-Proxy -nodeExe $nodeExe -proxyScript $proxyScript
+    $script:notify.ShowBalloonTip(4000, "Key Pool Proxy", "已重启：网关 :$proxyPort + 适配器 :$adapterPort", [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
 # ─── Build context menu ───
@@ -177,6 +221,12 @@ $itemStop.Text = "停止代理"
 $itemStop.Enabled = $false
 $itemStop.Add_Click({
     Stop-Proxy
+})
+
+$itemRestart = New-Object System.Windows.Forms.ToolStripMenuItem
+$itemRestart.Text = "重启代理"
+$itemRestart.Add_Click({
+    Restart-Proxy
 })
 
 $itemSep1 = New-Object System.Windows.Forms.ToolStripSeparator
@@ -216,7 +266,7 @@ $itemExit.Add_Click({
     [System.Windows.Forms.Application]::Exit()
 })
 
-$menu.Items.AddRange(@($itemManage, $itemSep1, $itemStart, $itemStop, $itemAuto, $itemExit))
+$menu.Items.AddRange(@($itemManage, $itemSep1, $itemStart, $itemStop, $itemRestart, $itemAuto, $itemExit))
 $notify.ContextMenuStrip = $menu
 
 # Double-click opens management page

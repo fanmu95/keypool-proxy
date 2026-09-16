@@ -3,6 +3,7 @@
 
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
@@ -68,6 +69,8 @@ function getStats() {
       prefix: config.providers[pid].prefix || null,
       mode: providerMode(pid),
       raceMode: config.providers[pid].raceMode,   // legacy: undefined = inherit global
+      autoRefreshModels: config.providers[pid].autoRefreshModels !== false,
+      autoProbeEffort: config.providers[pid].autoProbeEffort !== false,
       modelOverrides: config.providers[pid].modelOverrides || {},
       disabledModels: config.providers[pid].disabledModels || {},
       keys: []
@@ -268,21 +271,28 @@ function startProbeAll(pid) {
 }
 
 // ─── Auto-refresh upstream model lists; new models default to their highest supported effort ───
+// Per-provider switches: prov.autoRefreshModels / prov.autoProbeEffort (default on)
 async function autoRefreshModels() {
-  if (config.autoRefreshModels === false) return;
+  const now = Date.now();
   for (const pid in config.providers) {
+    const prov = config.providers[pid];
+    if (prov.autoRefreshModels === false) continue;   // 该提供商不自动刷新
     try {
       const ids = await fetchUpstreamModels(pid);
       const old = modelsCache[pid] ? modelsCache[pid].ids : null;
-      modelsCache[pid] = { ts: Date.now(), ids };
-      const prov = config.providers[pid];
+      modelsCache[pid] = { ts: now, ids };
       if (!prov.modelOverrides) prov.modelOverrides = {};
       let added = 0;
+      const autoProbe = prov.autoProbeEffort !== false;   // 该提供商是否自动探测
       for (const m of ids) {
         if (!(m in prov.modelOverrides)) {
           // New model: probe and default to its highest supported effort (plan B).
           // Disabled models stay hidden and keep no default effort.
           if (isModelDisabled(pid, m)) continue;
+          if (!autoProbe) {
+            log(`[MODELS] ${pid} new model "${m}" (auto-probe off, no default effort)`);
+            continue;
+          }
           const best = await probeBestEffort(pid, m);
           prov.modelOverrides[m] = best;
           added++;
@@ -990,6 +1000,107 @@ async function handleProxy(req, res) {
   res.end(JSON.stringify({ error: 'All retries exhausted', provider: providerName, attempts: maxRetries }));
 }
 
+// ─── Service health: 网关(:9119) + Codex 适配器(:9189) + 管理端(:9120) ───
+const ADAPTER_PORT = parseInt(process.env.ADAPTER_PORT, 10) || 9189;
+const ADAPTER_SCRIPT = path.join(__dirname, 'responses-adapter.js');
+let servicesCache = { ts: 0, data: null };
+
+// TCP 探活: 能否建立到 127.0.0.1:port 的连接
+function tcpProbe(port, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const sock = net.connect({ host: '127.0.0.1', port });
+    const finish = (up) => {
+      if (done) return;
+      done = true;
+      try { sock.destroy(); } catch (e) { /* ignore */ }
+      resolve(up);
+    };
+    sock.setTimeout(timeoutMs || 800);
+    sock.on('connect', () => finish(true));
+    sock.on('timeout', () => finish(false));
+    sock.on('error', () => finish(false));
+  });
+}
+
+// 服务状态(带 3 秒缓存, 页面 10 秒轮询不会打爆探活)
+async function getServices() {
+  const now = Date.now();
+  if (servicesCache.data && (now - servicesCache.ts) < 3000) return servicesCache.data;
+  const adapterUp = await tcpProbe(ADAPTER_PORT, 800);
+  const data = [
+    { id: 'gateway', name: '聚合网关', port: config.port, up: true, required: true,
+      desc: '客户端出站入口 (本页所在服务)' },
+    { id: 'adapter', name: '协议适配器', port: ADAPTER_PORT, up: adapterUp, required: true,
+      desc: 'responses ⇄ chat 协议翻译, Codex 必需; 未运行时 Codex 会报 502' },
+    { id: 'manage', name: '管理界面', port: config.managePort, up: true, required: false,
+      desc: '当前管理页面' },
+  ];
+  servicesCache = { ts: now, data };
+  return data;
+}
+
+// 定位 node.exe (版本目录会变, 不写死)
+function findNodeExe() {
+  const cands = [];
+  const versionsDir = 'C:\\Users\\55007\\.workbuddy\\binaries\\node\\versions';
+  try {
+    if (fs.existsSync(versionsDir)) {
+      for (const d of fs.readdirSync(versionsDir)) {
+        if (d.indexOf('.deleting') >= 0) continue;
+        const p = path.join(versionsDir, d, 'node.exe');
+        if (fs.existsSync(p)) cands.push(p);
+      }
+    }
+  } catch (e) { /* ignore */ }
+  cands.push('D:\\node\\node.exe');
+  for (const c of cands) {
+    try { if (fs.existsSync(c)) return c; } catch (e) { /* ignore */ }
+  }
+  return process.execPath;   // 兜底: 当前运行网关的 node
+}
+
+// 查询监听指定端口的 PID (Windows)
+function portPid(port) {
+  try {
+    const out = require('child_process').execSync('netstat -ano -p tcp', { encoding: 'utf8', windowsHide: true });
+    for (const line of out.split(/\r?\n/)) {
+      if (line.indexOf(':' + port) < 0) continue;
+      if (!/LISTENING/.test(line)) continue;
+      const parts = line.trim().split(/\s+/);
+      const pid = parseInt(parts[parts.length - 1], 10);
+      if (pid) return pid;
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+function startAdapterService() {
+  if (!fs.existsSync(ADAPTER_SCRIPT)) return { ok: false, message: '未找到 responses-adapter.js' };
+  const nodeExe = findNodeExe();
+  if (!nodeExe) return { ok: false, message: '未找到 node.exe' };
+  try {
+    const child = require('child_process').spawn(nodeExe, [ADAPTER_SCRIPT], {
+      cwd: __dirname, detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    child.unref();
+    return { ok: true, node: nodeExe, pid: child.pid };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+}
+
+function stopAdapterService() {
+  const pid = portPid(ADAPTER_PORT);
+  if (!pid) return { ok: true, already: true, message: '适配器本就未运行' };
+  try {
+    require('child_process').execSync('taskkill /PID ' + pid + ' /F', { stdio: 'ignore', windowsHide: true });
+    return { ok: true, killed: pid };
+  } catch (e) {
+    return { ok: false, message: '结束进程失败: ' + e.message };
+  }
+}
+
 // ─── Management API ───
 async function handleManage(req, res) {
   const parsed = url.parse(req.url, true);
@@ -1005,10 +1116,12 @@ async function handleManage(req, res) {
 
   // GET /api/status
   if (method === 'GET' && p === '/api/status') {
+    const services = await getServices();
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       proxyPort: config.port,
       managePort: config.managePort,
+      services: services,
       maxRetries: config.maxRetries,
       retryDelay: config.retryDelay || 0,
       requestTimeout: config.requestTimeout || 30000,
@@ -1025,6 +1138,45 @@ async function handleManage(req, res) {
       providers: getStats(),
       recentLogs: recentLogs.slice(-50)
     }));
+    return;
+  }
+
+  // GET /api/services — 服务端口状态(独立查询, 不走 /api/status 全量)
+  if (method === 'GET' && p === '/api/services') {
+    const services = await getServices();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ services: services }));
+    return;
+  }
+
+  // POST /api/services/adapter/start|stop|restart — 协议适配器(:9189)控制
+  if (method === 'POST' && /^\/api\/services\/adapter\/(start|stop|restart)$/.test(p)) {
+    const action = p.split('/').pop();
+    let result = { ok: true };
+    if (action === 'start') {
+      const up = await tcpProbe(ADAPTER_PORT, 500);
+      if (up) result = { ok: true, already: true, message: '适配器已在运行' };
+      else {
+        result = startAdapterService();
+        if (result.ok) await new Promise((r) => setTimeout(r, 900));
+      }
+    } else if (action === 'stop') {
+      result = stopAdapterService();
+      await new Promise((r) => setTimeout(r, 400));
+    } else {   // restart
+      const stopRes = stopAdapterService();
+      await new Promise((r) => setTimeout(r, 500));
+      result = startAdapterService();
+      if (result.ok) await new Promise((r) => setTimeout(r, 900));
+      result.stopped = stopRes.killed || null;
+    }
+    servicesCache = { ts: 0, data: null };            // 立即失效缓存, 让页面拿到真实状态
+    const up = await tcpProbe(ADAPTER_PORT, 800);
+    servicesCache = { ts: 0, data: null };
+    log(`[SERVICE] adapter ${action} -> ${up ? 'UP' : 'DOWN'}${result.message ? ' (' + result.message + ')' : ''}`);
+    res.writeHead(result.ok ? 200 : 500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: result.ok, action: action, port: ADAPTER_PORT, up: up,
+      message: result.message || (up ? '适配器运行中' : '适配器未启动'), node: result.node || null }));
     return;
   }
 
@@ -1240,6 +1392,26 @@ async function handleManage(req, res) {
     log(`[MGR] Provider added: ${v.id} (${v.name}) prefix=${v.prefix} keys=${keys.length}`);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // POST /api/provider/:id/autosettings — per-provider auto refresh / auto probe switches
+  if (method === 'POST' && p.match(/^\/api\/provider\/[^/]+\/autosettings$/)) {
+    const providerId = p.split('/')[3];
+    const prov = config.providers[providerId];
+    if (!prov) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unknown provider' }));
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (body.autoRefreshModels !== undefined) prov.autoRefreshModels = (body.autoRefreshModels === true || body.autoRefreshModels === 'true');
+    if (body.autoProbeEffort !== undefined) prov.autoProbeEffort = (body.autoProbeEffort === true || body.autoProbeEffort === 'true');
+    saveConfig();
+    reloadConfig();
+    log(`[MGR] ${providerId} auto settings: refresh=${prov.autoRefreshModels !== false} probe=${prov.autoProbeEffort !== false}`);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, autoRefreshModels: prov.autoRefreshModels !== false, autoProbeEffort: prov.autoProbeEffort !== false }));
     return;
   }
 
@@ -1621,6 +1793,12 @@ details.adv .adv-inner { margin-top:10px; display:grid; grid-template-columns:re
 .mf input, .mf textarea { width:100%; }
 textarea.inp { font-family:var(--mono); resize:vertical; }
 .m-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
+.chk { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text); cursor:pointer; }
+.chk input { width:auto; }
+.chk.sm { gap:4px; font-size:12px; color:var(--text2); white-space:nowrap; }
+.config-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.config-label { font-size:13px; color:var(--text2); }
+.config-row .hint { width:100%; }
 @media (max-width:720px){ .mode-group { grid-template-columns:1fr; } }
 </style>
 </head>
@@ -1700,7 +1878,7 @@ textarea.inp { font-family:var(--mono); resize:vertical; }
 <div class="ov" id="providerModal">
   <div class="modal">
     <h3 id="pmTitle">添加提供商</h3>
-    <div class="mf"><label>ID（小写字母开头，创建后不可改）</label><input class="inp" id="pmId" placeholder="myapi"></div>
+    <div class="mf"><label>ID（小写字母开头，创建后不可改）</label><input class="inp" id="pmId" placeholder="myapi" oninput="validatePmId()"><div id="pmIdHint" style="font-size:12px;color:var(--text3);margin-top:4px"></div></div>
     <div class="mf"><label>名称</label><input class="inp" id="pmName" placeholder="My API"></div>
     <div class="mf"><label>路径前缀（客户端访问 /前缀/v1/...）</label><input class="inp" id="pmPrefix" placeholder="/my"></div>
     <div class="mf"><label>Base URL（官方根域，不带 /v1）</label><input class="inp" id="pmTarget" placeholder="https://api.example.com"></div>
@@ -1731,6 +1909,18 @@ async function loadStatus() {
   }
 }
 
+async function serviceAction(action) {
+  try {
+    const r = await fetch(API + '/api/services/adapter/' + action, { method: 'POST' });
+    const j = await r.json();
+    const label = { start: '启动', stop: '停止', restart: '重启' }[action] || action;
+    showToast('适配器' + label + '：' + (j.message || (j.up ? '运行中' : '未启动')));
+    setTimeout(loadStatus, 1200);
+  } catch (e) {
+    showToast('操作失败: ' + e.message);
+  }
+}
+
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = (s === undefined || s === null) ? '' : String(s);
@@ -1755,8 +1945,21 @@ function render() {
     for (const k of d.providers[pid].keys) { tk++; tok += k.success; tf += k.fail; }
   }
   const modeName = { normal: '普通', smart: 'Smart', pro: 'Pro', promax: 'Pro Max' }[d.mode] || '普通';
-  pills.innerHTML =
-    '<span class="pill"><span class="dot" style="background:var(--ok)"></span>代理 :' + d.proxyPort + '</span>' +
+  const svcList = (d.services && d.services.length) ? d.services
+    : [{ id: 'gateway', name: '聚合网关', port: d.proxyPort, up: true, desc: '' }];
+  const svcPills = svcList.map(function (s) {
+    return '<span class="pill" title="' + esc(s.desc || '') + '">' +
+      '<span class="dot" style="background:var(--' + (s.up ? 'ok' : 'fail') + ')"></span>' +
+      esc(s.name) + ' :' + s.port + (s.up ? '' : ' 未运行') + '</span>';
+  }).join('');
+  const adapter = svcList.filter(function (s) { return s.id === 'adapter'; })[0];
+  let svcBtn = '';
+  if (adapter) {
+    svcBtn = adapter.up
+      ? '<button class="btn sm" onclick="serviceAction(\\\'restart\\\')" title="重启 9189 适配器（Codex 链路）">重启适配器</button>'
+      : '<button class="btn sm primary" onclick="serviceAction(\\\'start\\\')" title="启动 9189 适配器（Codex 链路），未运行时 Codex 会报 502">启动适配器</button>';
+  }
+  pills.innerHTML = svcPills + svcBtn +
     '<span class="pill"><b>' + modeName + '</b></span>' +
     '<span class="pill">密钥 <b>' + tk + '</b></span>' +
     '<span class="pill"><b class="ok">' + tok + '</b> 成功</span>' +
@@ -1936,6 +2139,18 @@ async function loadModels(pid, force) {
 
 function refreshModels(pid) { modelsUI[pid] = null; loadModels(pid, true); }
 
+async function setProviderAuto(pid, which, checked) {
+  const body = (which === 'refresh') ? { autoRefreshModels: checked } : { autoProbeEffort: checked };
+  try {
+    const r = await fetch(API + '/api/provider/' + encodeURIComponent(pid) + '/autosettings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!r.ok || !j.ok) { showToast('保存失败: ' + (j.error || r.status), true); return; }
+    showToast(pid + ' · ' + (which === 'refresh' ? '自动刷新' : '自动测思考') + (checked ? '已开启' : '已关闭'));
+  } catch (e) {
+    showToast('保存失败: ' + e.message, true);
+  }
+}
+
 async function probeEffort(pid, model) {
   const key = pid + '|' + model;
   probeUI[key] = 'loading';
@@ -2036,6 +2251,8 @@ function renderModelCards(d) {
         (p.prefix ? '<span class="p-prefix">' + esc(p.prefix) + '</span>' : '') +
         '<span class="p-url">' + (Array.isArray(ids) ? ids.length + ' 个模型' + (offCount ? '（禁用 ' + offCount + '）' : '') : '') + '</span>' +
         '<span class="p-url">' + (Object.keys(ovs).length ? '已强制 ' + Object.keys(ovs).length : '') + '</span>' +
+        '<label class="chk sm" title="自动刷新该提供商模型列表（每 10 分钟）"><input type="checkbox" onchange="setProviderAuto(\\\'' + pid + '\\\',\\\'refresh\\\',this.checked)"' + (p.autoRefreshModels !== false ? ' checked' : '') + '>自动刷新</label>' +
+        '<label class="chk sm" title="新模型自动测试思考强度并写入默认档位"><input type="checkbox" onchange="setProviderAuto(\\\'' + pid + '\\\',\\\'probe\\\',this.checked)"' + (p.autoProbeEffort !== false ? ' checked' : '') + '>自动测思考</label>' +
         '<span class="spacer"></span>' +
         '<button class="btn primary sm" onclick="probeAllStart(\\\'' + pid + '\\\')"' + (jobActive ? ' disabled' : '') + '>' + (jobActive ? '测试中 ' + (job ? job.done + '/' + job.total : '') : '一键测试') + '</button>' +
         '<button class="btn sm" onclick="loadModels(\\\'' + pid + '\\\',false)">加载模型</button>' +
@@ -2169,10 +2386,27 @@ async function delKey(pid, index) {
   loadStatus();
 }
 
+function validatePmId() {
+  const idEl = document.getElementById('pmId');
+  const hint = document.getElementById('pmIdHint');
+  if (!idEl || !hint) return;
+  if (idEl.disabled) { hint.textContent = ''; return; }   // 编辑态不可改
+  const v = idEl.value.trim();
+  if (!v) { hint.textContent = ''; return; }
+  if (/^[a-z][a-z0-9]{0,19}$/.test(v)) {
+    hint.textContent = '✓ 可用';
+    hint.style.color = 'var(--ok)';
+  } else {
+    hint.textContent = '仅限小写字母开头、小写字母+数字、≤20 字符（如 myapi）';
+    hint.style.color = 'var(--fail)';
+  }
+}
+
 function openProviderModal(pid) {
   pmEditingId = pid;
   document.getElementById('pmTitle').textContent = pid ? '编辑提供商' : '添加提供商';
   const idEl = document.getElementById('pmId');
+  const idHint = document.getElementById('pmIdHint');
   if (pid && statusData && statusData.providers[pid]) {
     const p = statusData.providers[pid];
     document.getElementById('pmName').value = p.name || '';
@@ -2180,12 +2414,14 @@ function openProviderModal(pid) {
     document.getElementById('pmTarget').value = p.targetUrl || '';
     document.getElementById('pmKeys').value = '';
     idEl.value = pid; idEl.disabled = true; idEl.style.opacity = .55;
+    if (idHint) idHint.textContent = '';
   } else {
     document.getElementById('pmName').value = '';
     document.getElementById('pmPrefix').value = '';
     document.getElementById('pmTarget').value = '';
     document.getElementById('pmKeys').value = '';
     idEl.value = ''; idEl.disabled = false; idEl.style.opacity = 1;
+    if (idHint) idHint.textContent = '';
   }
   document.getElementById('providerModal').classList.add('show');
 }
@@ -2199,6 +2435,15 @@ async function saveProvider() {
   const name = document.getElementById('pmName').value.trim();
   const prefix = document.getElementById('pmPrefix').value.trim();
   const targetUrl = document.getElementById('pmTarget').value.trim();
+  // 前端即时校验：新增时 id 必须合规（编辑态 id 锁定，由后端强制路径 id）
+  if (!pmEditingId && !/^[a-z][a-z0-9]{0,19}$/.test(id)) {
+    showToast('ID 需小写字母开头、仅小写字母+数字、≤20 字符（如 workbuddygj），请修改后保存', true);
+    return;
+  }
+  if (!/^\\/[a-z0-9]{1,12}$/.test(prefix)) {
+    showToast('前缀需以 / 开头、仅小写字母+数字、≤12 字符（如 /wbgj）', true);
+    return;
+  }
   const keysText = document.getElementById('pmKeys').value.trim();
   const keys = [];
   if (keysText) {
@@ -2210,7 +2455,9 @@ async function saveProvider() {
       else keys.push(t);
     }
   }
-  const body = { name, prefix, targetUrl, keys };
+  // id 必须回传：新增时后端用它做唯一键与格式校验（漏传会导致
+  // 「id 需以小写字母开头…」恒失败）；编辑时后端强制使用路径中的 id。
+  const body = { id, name, prefix, targetUrl, keys };
   const url = pmEditingId ? API + '/api/providers/' + encodeURIComponent(pmEditingId) : API + '/api/providers';
   const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));

@@ -19,6 +19,10 @@ const path = require('path');
 
 const PORT = parseInt(process.env.ADAPTER_PORT, 10) || 9189;
 const GATEWAY = (process.env.GATEWAY_URL || 'http://127.0.0.1:9119').replace(/\/+$/, '');
+// 客户端(Codex)通常不指定输出上限, 上游默认仅 8192 tokens —— 长上下文任务会把
+// 预算全烧在思考上导致 finish_reason=length、正文为空。这里补一个更大的默认值。
+// 注: 1M 是上下文(输入)上限, 输出上限另算; sensenova 各模型文档口径输出上限约 64K。
+const DEFAULT_MAX_OUTPUT_TOKENS = parseInt(process.env.DEFAULT_MAX_OUTPUT_TOKENS, 10) || 65536;
 const LOG_FILE = path.join(__dirname, 'adapter.log');
 
 function log(msg) {
@@ -112,7 +116,10 @@ function buildChatRequest(rBody) {
   if (tools) { chat.tools = tools; chat.tool_choice = mapToolChoice(rBody.tool_choice); }
   const eff = rBody.reasoning && rBody.reasoning.effort;
   if (eff) chat.reasoning_effort = eff;
-  if (rBody.max_output_tokens) chat.max_tokens = rBody.max_output_tokens;
+  // 输出上限: 客户端指定则尊重, 未指定则补默认(上游默认 8192 太小, 思考会吃光预算)
+  chat.max_tokens = (rBody.max_output_tokens && rBody.max_output_tokens > 0)
+    ? rBody.max_output_tokens
+    : DEFAULT_MAX_OUTPUT_TOKENS;
   if (rBody.temperature !== undefined && rBody.temperature !== null) chat.temperature = rBody.temperature;
   if (rBody.top_p !== undefined && rBody.top_p !== null) chat.top_p = rBody.top_p;
   if (chat.stream) chat.stream_options = { include_usage: true };
@@ -201,6 +208,7 @@ function streamResponses(req, res, chatBodyStr, model) {
   let rsItem = null, msgItem = null;
   const toolCalls = {};
   let usage = null;
+  let finishReason = null;
   let done = false;
 
   function ensureReasoning() {
@@ -226,6 +234,7 @@ function streamResponses(req, res, chatBodyStr, model) {
     try { evt = JSON.parse(dataStr); } catch (e) { return; }
     if (evt.usage) usage = evt.usage;
     const choice = (evt.choices && evt.choices[0]) || {};
+    if (choice.finish_reason) finishReason = choice.finish_reason;
     const delta = choice.delta || {};
     if (delta.reasoning_content) {
       ensureReasoning();
@@ -291,7 +300,14 @@ function streamResponses(req, res, chatBodyStr, model) {
     });
     sseWrite(res, 'response.completed', { type: 'response.completed', response: finalResp });
     res.end();
-    log(`[STREAM] model=${model} text=${msgItem ? msgItem.text.length : 0}ch reasoning=${rsItem ? rsItem.text.length : 0}ch tools=${tcIdxs.length}`);
+    const rc = rsItem ? rsItem.text.length : 0;
+    const tx = msgItem ? msgItem.text.length : 0;
+    const u = usage || {};
+    const rt = (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) || 0;
+    log(`[STREAM] model=${model} text=${tx}ch reasoning=${rc}ch tools=${tcIdxs.length} finish=${finishReason || '未收到'}` +
+      ` completion_tokens=${u.completion_tokens === undefined ? '-' : u.completion_tokens} reasoning_tokens=${rt}` +
+      ` total_tokens=${u.total_tokens === undefined ? '-' : u.total_tokens}` +
+      (finishReason === 'length' ? ' ⚠截断' : ''));
   }
 
   forwardToGateway('/v1/chat/completions', 'POST', req.headers, chatBodyStr, (up) => {
@@ -376,7 +392,11 @@ const server = http.createServer((req, res) => {
       }
       const chatReq = buildChatRequest(rBody);
       const chatBody = Buffer.from(JSON.stringify(chatReq), 'utf8');
-      log(`[TRANSLATE] model=${rBody.model} msgs=${chatReq.messages.length} tools=${(chatReq.tools || []).length} stream=${!!chatReq.stream}`);
+      log(`[TRANSLATE] model=${rBody.model} msgs=${chatReq.messages.length} tools=${(chatReq.tools || []).length} stream=${!!chatReq.stream}` +
+        ` in_max_output_tokens=${rBody.max_output_tokens === undefined ? '未指定' : rBody.max_output_tokens}` +
+        ` out_max_tokens=${chatReq.max_tokens === undefined ? '未指定' : chatReq.max_tokens}` +
+        ` effort=${rBody.reasoning && rBody.reasoning.effort ? rBody.reasoning.effort : '未指定'}` +
+        ` in_chars=${bodyBuf.length}`);
 
       if (chatReq.stream) {
         streamResponses(req, res, chatBody, rBody.model);
