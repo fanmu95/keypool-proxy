@@ -18,13 +18,26 @@ let weightState = {};     // provider -> { current, currentWeight } for weighted
 let stats = {};          // provider -> { key -> { success, fail, lastStatus, lastTime, avgLatency } }
 let recentLogs = [];     // ring buffer of recent log lines
 const MAX_LOGS = 200;
+let modeEpoch = 0;            // 模式代际：切换模式时 ++，在飞请求据此感知并中止后按新模式补发
+const inflight = new Set();   // 在飞的上游 http request 对象（切换模式时统一中止）
+const MODE_RESTART_LIMIT = 10;  // 模式切换补发上限，防切换死循环
 
 // ─── Logging ───
 const LOG_FILE = path.join(__dirname, 'proxy.log');
+const ANSI = { reset: '\x1b[0m', green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m', cyan: '\x1b[36m' };
+function logColor(msg) {
+  if (msg.includes('[RACE WIN]') || msg.includes('[200]')) return ANSI.green;      // 胜出/成功 → 绿
+  if (msg.includes('[429]') || msg.includes('[SMART]')) return ANSI.yellow;         // 限流/冷却 → 黄
+  if (msg.includes('[ERR]') || msg.includes('[TIMEOUT]') || msg.includes('[500]') || msg.includes('[502]') || msg.includes('[503]') || msg.includes('[504]') || msg.includes('[EXHAUSTED]') || msg.includes('[CIRCUIT]') || msg.includes('[RACE FAILED]')) return ANSI.red;
+  if (msg.includes('[MGR]') || msg.includes('[MODE SWITCH]')) return ANSI.cyan;
+  return null;
+}
 function log(msg) {
   const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const line = `[${ts}] ${msg}`;
-  console.log(line);
+  // 控制台按级别着色（仅 TTY）；recentLogs 与日志文件保持纯文本
+  const color = process.stdout.isTTY ? logColor(msg) : null;
+  console.log(color ? color + line + ANSI.reset : line);
   recentLogs.push(line);
   if (recentLogs.length > MAX_LOGS) recentLogs.shift();
   // Persist to disk so a crash leaves evidence (sync: tiny volume, always survives)
@@ -169,9 +182,20 @@ async function fetchUpstreamModels(pid) {
   return (d.data || []).map(m => m.id).filter(Boolean);
 }
 
+// 真实探测一个密钥对上游是否有效（保存提供商/添加密钥时做鉴权提醒，不阻止保存）
+async function probeApiKey(targetUrl, key) {
+  try {
+    const r = await forwardRequest(targetUrl, '/v1/models', {}, 'GET', null, keyValue(key), 8000);
+    const txt = (await drainResponse(r)).toString('utf8');
+    return { ok: r.statusCode === 200, http: r.statusCode, msg: String(txt).replace(/\s+/g, ' ').slice(0, 120) };
+  } catch (e) {
+    return { ok: false, http: 0, msg: String(e.message).slice(0, 120) };
+  }
+}
+
 // ─── Reasoning-effort probing ───
 // Probe one model across all efforts. onEach(eff, result) fires after each level.
-async function probeModelEfforts(pid, model, onEach) {
+async function probeModelEfforts(pid, model, onEach, shouldStop) {
   const prov = config.providers[pid];
   if (!prov) throw new Error('unknown provider');
   const apiKey = anyKeyAvailable(pid) || ((prov.keys && prov.keys[0]) ? keyValue(prov.keys[0]) : null);
@@ -211,6 +235,8 @@ async function probeModelEfforts(pid, model, onEach) {
       results[eff] = { http: 0, ms: Date.now() - t0, hasReasoning: false, related: false, snippet: String(err.message).slice(0, 220) };
     }
     if (onEach) onEach(eff, results[eff]);
+    // 档间检查点：暂停/停止时立即中断当前模型的剩余档位（已测结果部分保留）
+    if (shouldStop && shouldStop()) break;
   }
   return results;
 }
@@ -235,12 +261,13 @@ async function probeBestEffort(pid, model) {
 }
 
 // ─── Provider-wide probe jobs ("one-click test") ───
-const probeJobs = {};   // pid -> { running, total, done, current, results: {model: {...}}, error }
+// status: 'running' | 'paused' | 'stopping' | 'done' | 'stopped'（stopped=用户主动停止，done=自然完成）
+const probeJobs = {};   // pid -> { status, running, total, done, current, results: {model: {...}}, error }
 
 function startProbeAll(pid) {
   const prev = probeJobs[pid];
-  if (prev && prev.running) return false;
-  const job = probeJobs[pid] = { running: true, total: 0, done: 0, current: '', results: prev ? prev.results : {}, error: null, startedAt: Date.now() };
+  if (prev && (prev.status === 'running' || prev.status === 'paused' || prev.status === 'stopping')) return false;
+  const job = probeJobs[pid] = { status: 'running', running: true, total: 0, done: 0, current: '', results: prev ? prev.results : {}, error: null, startedAt: Date.now() };
   (async () => {
     try {
       let ids = modelsCache[pid] ? modelsCache[pid].ids : null;
@@ -250,18 +277,26 @@ function startProbeAll(pid) {
       const CONC = 3;   // model-level concurrency
       let idx = 0;
       const worker = async () => {
-        while (job.running) {
+        while (true) {
+          // 停止中：worker 立即退出
+          if (job.status === 'stopping' || job.status === 'done') return;
+          // 暂停：自旋等待，直到恢复或停止
+          while (job.status === 'paused') await sleep(300);
+          if (job.status === 'stopping' || job.status === 'done') return;
           const i = idx++;
-          if (i >= ids.length) break;
+          if (i >= ids.length) return;
           const model = ids[i];
           job.current = model;
-          job.results[model] = await probeModelEfforts(pid, model, () => { job.done++; });
+          // 档间检查：paused/stopping 都会中断当前模型剩余档位（部分结果保留）
+          job.results[model] = await probeModelEfforts(pid, model, () => { job.done++; }, () => job.status !== 'running');
         }
       };
       await Promise.all([worker(), worker(), worker()]);
+      if (job.status === 'stopping') { job.status = 'stopped'; job.current = ''; log(`[MGR] probe-all stopped for ${pid}: ${Object.keys(job.results).length} model(s) probed`); }
+      else { job.status = 'done'; log(`[MGR] probe-all finished for ${pid}: ${ids.length} model(s)`); }
       job.running = false;
-      log(`[MGR] probe-all finished for ${pid}: ${ids.length} model(s)`);
     } catch (e) {
+      job.status = 'done';
       job.running = false;
       job.error = e.message;
       log(`[MGR] probe-all failed for ${pid}: ${e.message}`);
@@ -481,8 +516,10 @@ function isRetryable(statusCode) {
 // ─── Race mode: fire ALL keys concurrently, first 200 wins, losers aborted ───
 // Each leg retries independently on failure; as soon as one leg succeeds its
 // response is streamed to the client and every other in-flight leg is destroyed.
-async function handleProxyRace(req, res, provider, providerName, targetUrl, keys, subPath, query, body, cfg) {
+async function handleProxyRace(req, res, provider, providerName, targetUrl, keys, subPath, query, body, cfg, epoch) {
   const keyList = keys.map(keyValue);
+  const myMode = providerMode(provider);
+  let raceRestart = false;   // 模式切换标记：收尾时返回 RESTART 由外层补发
   // Pro Max: fire multiple staggered rounds of the full key pool.
   // legs = keys x raceRounds; round r starts after r*roundDelay ms.
   // First 200 anywhere wins; every other leg (past or future round) is killed.
@@ -542,12 +579,20 @@ async function handleProxyRace(req, res, provider, providerName, targetUrl, keys
     // while we waited (or while an earlier leg was in flight), don't fire.
     if (round > 0 && roundDelay > 0) {
       await sleep(round * roundDelay);
-      if (settled || Date.now() > hardDeadline) return;
+      if (settled || Date.now() > hardDeadline || modeEpoch !== epoch) return;
     }
 
     for (let attempt = 0; attempt < cfg.maxRetries; attempt++) {
       if (settled) return;                    // another leg already won
       if (Date.now() > hardDeadline) return;  // global deadline reached
+      // 模式切换：中止全部在飞 leg，由外层按新模式补发
+      if (modeEpoch !== epoch && providerMode(provider) !== myMode) {
+        raceRestart = true;
+        settled = true;
+        log(`[RACE SWITCH] ${providerName} mode changed, aborting legs for restart`);
+        abortLosers(null);
+        return;
+      }
 
       const startTime = Date.now();
       const ctrl = { req: null };
@@ -557,7 +602,7 @@ async function handleProxyRace(req, res, provider, providerName, targetUrl, keys
       try {
         upstreamRes = await forwardRequest(
           targetUrl, subPath + query, req.headers, req.method, body, apiKey, cfg.requestTimeout,
-          (r) => { ctrl.req = r; }
+          (r) => { ctrl.req = r; inflight.add(r); r.once('close', () => inflight.delete(r)); }
         );
       } catch (err) {
         if (settled) {
@@ -678,6 +723,8 @@ async function handleProxyRace(req, res, provider, providerName, targetUrl, keys
       res.end(JSON.stringify({ error: 'All race legs failed', provider: providerName, legs: legs.length }));
     }
   }
+  if (raceRestart && !res.headersSent) return 'RESTART';
+  return null;
 }
 
 // ─── Aggregate unified entry: /v1/* with "Provider/model" naming ───
@@ -832,21 +879,29 @@ async function handleProxy(req, res) {
   const circuitBreaker = config.circuitBreaker || 8;  // max consecutive failures before giving up immediately
   const query = parsed.search || '';
 
-  // Mode dispatch: normal (sequential) vs pro/promax (race family)
+  // Mode dispatch: normal (sequential) vs pro/promax (race family).
+  // 模式切换可在请求进行中发生：外层循环在 mode 变化时中止在飞请求并按新模式补发（RESTART）。
+  for (let restart = 0; restart < MODE_RESTART_LIMIT; restart++) {
+  const epoch = modeEpoch;
   const mode = providerMode(provider);
   if (mode === 'pro' || mode === 'promax') {
     const rounds = (mode === 'promax') ? (parseInt(config.raceRounds) || 3) : 1;
     log(`[RACE] ${providerName} ${mode} mode: ${keys.length} key(s) x ${rounds} round(s) firing`);
-    return await handleProxyRace(req, res, provider, providerName, targetUrl, keys, subPath, query, body, {
+    const outcome = await handleProxyRace(req, res, provider, providerName, targetUrl, keys, subPath, query, body, {
       maxRetries, retryDelay, requestTimeout, overallTimeout, circuitBreaker,
       raceMinRetryDelay: config.raceMinRetryDelay || 500,
       raceCircuitBreaker: config.raceCircuitBreaker || 5,
       raceRounds: rounds,
       roundDelay: config.roundDelay || 0
-    });
+    }, epoch);
+    if (outcome === 'RESTART') { log(`[MODE SWITCH] ${providerName} race restarted under new mode (#${restart + 1})`); continue; }
+    return;
   }
 
+  const myMode = mode;
   const hardDeadline = Date.now() + overallTimeout;
+  const modeChanged = () => (!res.headersSent && modeEpoch !== epoch && providerMode(provider) !== myMode);
+  let restartSeq = false;
 
   // Client disconnect: cancel the in-flight upstream request immediately and
   // stop retrying, so the model stops generating (and stops billing tokens).
@@ -861,6 +916,13 @@ async function handleProxy(req, res) {
   });
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // 模式切换：中止在飞上游请求，跳出重试循环由外层按新模式补发
+    if (modeChanged()) {
+      if (ctrlReq && !ctrlReq.destroyed) { try { ctrlReq.destroy(); } catch (e) { /* already gone */ } }
+      log(`[MODE SWITCH] ${providerName} aborting attempt ${attempt + 1} for new mode`);
+      restartSeq = true;
+      break;
+    }
     // Safety net: if total time spent exceeds overallTimeout, stop retrying
     if (Date.now() > hardDeadline) {
       log(`[DEADLINE] ${providerName} overall ${overallTimeout}ms exceeded after ${attempt} attempts`);
@@ -902,7 +964,7 @@ async function handleProxy(req, res) {
     const startTime = Date.now();
 
     try {
-      const upstreamRes = await forwardRequest(targetUrl, subPath + query, req.headers, req.method, body, apiKey, requestTimeout, (r) => { ctrlReq = r; });
+      const upstreamRes = await forwardRequest(targetUrl, subPath + query, req.headers, req.method, body, apiKey, requestTimeout, (r) => { ctrlReq = r; inflight.add(r); r.once('close', () => inflight.delete(r)); });
       const status = upstreamRes.statusCode;
       const ct = (upstreamRes.headers['content-type'] || '').toLowerCase();
       const elapsed = Date.now() - startTime;
@@ -995,9 +1057,19 @@ async function handleProxy(req, res) {
   }
 
   // All retries exhausted
+  if (restartSeq) { log(`[MODE SWITCH] ${providerName} restarting under new mode (#${restart + 1})`); continue; }
   log(`[EXHAUSTED] ${providerName} all ${maxRetries} attempts failed`);
   res.writeHead(503, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'All retries exhausted', provider: providerName, attempts: maxRetries }));
+  return;
+  } // end mode-restart loop
+
+  // 模式切换补发次数超限：兜底响应，避免客户端悬挂
+  log(`[MODE SWITCH] ${providerName} exceeded ${MODE_RESTART_LIMIT} restarts, giving up`);
+  if (!res.headersSent) {
+    res.writeHead(504, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Mode switch loop exceeded', provider: providerName }));
+  }
 }
 
 // ─── Service health: 网关(:9119) + Codex 适配器(:9189) + 管理端(:9120) ───
@@ -1211,7 +1283,7 @@ async function handleManage(req, res) {
   }
 
   // POST /api/keys/:provider
-  if (method === 'POST' && p.startsWith('/api/keys/')) {
+  if (method === 'POST' && p.match(/^\/api\/keys\/[^/]+$/)) {
     const provider = p.split('/')[3];
     if (!config.providers[provider]) {
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -1231,8 +1303,11 @@ async function handleManage(req, res) {
     saveConfig();
     reloadConfig();
     log(`[MGR] Added key to ${provider} (weight=${keyWeight(newKey)}), total=${config.providers[provider].keys.length}`);
+    // 密钥有效性探测（仅提醒）：对新添加的 key 做真实鉴权
+    const keyCheck = await probeApiKey(config.providers[provider].targetUrl, newKey);
+    log(`[MGR] key-check ${provider}: http=${keyCheck.http} ok=${keyCheck.ok}`);
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, total: config.providers[provider].keys.length }));
+    res.end(JSON.stringify({ ok: true, total: config.providers[provider].keys.length, keyCheck }));
     return;
   }
 
@@ -1298,8 +1373,16 @@ async function handleManage(req, res) {
     if (body.circuitBreaker !== undefined) config.circuitBreaker = Math.max(1, parseInt(body.circuitBreaker) || 8);
     if (body.raceMode !== undefined) config.raceMode = (body.raceMode === true || body.raceMode === 'true');
     if (body.mode !== undefined && (body.mode === 'normal' || body.mode === 'smart' || body.mode === 'pro' || body.mode === 'promax')) {
+      const changed = (config.mode || 'normal') !== body.mode;
       config.mode = body.mode;
       config.raceMode = (body.mode === 'pro' || body.mode === 'promax');
+      // 模式真正变化时：代际 +1 并中止全部在飞上游请求 → 各请求检测到变化后按新模式补发
+      if (changed) {
+        modeEpoch++;
+        const list = Array.from(inflight);
+        for (const r of list) { try { if (!r.destroyed) r.destroy(); } catch (e) { /* gone */ } }
+        log(`[MODE SWITCH] mode -> ${body.mode} (epoch=${modeEpoch}), aborted ${list.length} in-flight request(s) for restart`);
+      }
     }
     if (body.cooldown429 !== undefined) config.cooldown429 = Math.max(1, parseInt(body.cooldown429) || 30);
     if (body.accessKey !== undefined) {
@@ -1390,8 +1473,11 @@ async function handleManage(req, res) {
     saveConfig();
     reloadConfig();
     log(`[MGR] Provider added: ${v.id} (${v.name}) prefix=${v.prefix} keys=${keys.length}`);
+    // 密钥有效性探测（仅提醒，不阻止保存）：用第一个 key 对上游做真实鉴权
+    let keyCheck = null;
+    if (keys.length > 0) { keyCheck = await probeApiKey(v.targetUrl, keys[0]); log(`[MGR] key-check ${v.id}: http=${keyCheck.http} ok=${keyCheck.ok}`); }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify({ ok: true, keyCheck }));
     return;
   }
 
@@ -1442,8 +1528,11 @@ async function handleManage(req, res) {
     saveConfig();
     reloadConfig();
     log(`[MGR] Provider updated: ${providerId} name=${v.name} prefix=${v.prefix}`);
+    // 密钥有效性探测（仅提醒）：用该提供商第一个 key 对新 targetUrl 做真实鉴权
+    let keyCheck = null;
+    if (prov.keys && prov.keys.length > 0) { keyCheck = await probeApiKey(prov.targetUrl, prov.keys[0]); log(`[MGR] key-check ${providerId}: http=${keyCheck.http} ok=${keyCheck.ok}`); }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify({ ok: true, keyCheck }));
     return;
   }
 
@@ -1611,17 +1700,41 @@ async function handleManage(req, res) {
     return;
   }
 
+  // POST /api/probe/control/:pid — pause / resume / stop the provider-wide probe job
+  if (method === 'POST' && p.match(/^\/api\/probe\/control\/[^/]+$/)) {
+    const pid = p.split('/')[4];
+    const job = probeJobs[pid];
+    let action = '';
+    try { action = ((await readJsonBody(req)).action || '').toString(); } catch (e) { action = ''; }
+    if (!job || !(job.status === 'running' || job.status === 'paused')) {
+      res.writeHead(409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No active probe job for this provider', status: job ? job.status : 'idle' }));
+      return;
+    }
+    if (action === 'pause' && job.status === 'running') { job.status = 'paused'; log(`[MGR] probe-all paused for ${pid}`); }
+    else if (action === 'resume' && job.status === 'paused') { job.status = 'running'; log(`[MGR] probe-all resumed for ${pid}`); }
+    else if (action === 'stop' && (job.status === 'running' || job.status === 'paused')) { job.status = 'stopping'; log(`[MGR] probe-all stop requested for ${pid}`); }
+    else {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid action for current state', action, status: job.status }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, action, status: job.status, running: job.running, done: job.done, total: job.total }));
+    return;
+  }
+
   // GET /api/probe/status/:pid — progress of the provider-wide probe job
   if (method === 'GET' && p.match(/^\/api\/probe\/status\/[^/]+$/)) {
     const pid = p.split('/')[4];
     const job = probeJobs[pid];
     if (!job) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ pid, running: false, total: 0, done: 0, results: {} }));
+      res.end(JSON.stringify({ pid, status: 'idle', running: false, total: 0, done: 0, results: {} }));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ pid, running: job.running, total: job.total, done: job.done, current: job.current, error: job.error, results: job.results }));
+    res.end(JSON.stringify({ pid, status: job.status, running: job.running, total: job.total, done: job.done, current: job.current, error: job.error, results: job.results }));
     return;
   }
 
@@ -2103,8 +2216,8 @@ async function probeAllStart(pid) {
     const j = await r.json();
     if (!r.ok) { alert(j.error || '启动失败'); return; }
   } catch (e) { alert('启动失败: ' + e.message); return; }
-  if (!allProbe[pid]) allProbe[pid] = { running: true, total: 0, done: 0, results: {} };
-  allProbe[pid].running = true;
+  if (!allProbe[pid]) allProbe[pid] = { status: 'running', running: true, total: 0, done: 0, results: {} };
+  else { allProbe[pid].status = 'running'; allProbe[pid].running = true; }
   collapsedUI['models|' + pid] = false;   // auto-expand to show progress
   const timer = setInterval(async () => {
     try {
@@ -2119,6 +2232,18 @@ async function probeAllStart(pid) {
     } catch (e) { /* keep polling */ }
   }, 2500);
   renderModelCards(statusData);
+}
+
+// 一键测试控制：pause / resume / stop
+async function probeControl(pid, action) {
+  try {
+    const r = await fetch(API + '/api/probe/control/' + encodeURIComponent(pid), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { alert(j.error || '操作失败'); return; }
+  } catch (e) { alert('操作失败: ' + e.message); return; }
+  // 立即刷新按钮态（暂停/继续即时反馈，不等 2.5s 轮询）
+  renderModelCards(statusData);
+  loadStatus();
 }
 
 async function loadModels(pid, force) {
@@ -2183,8 +2308,7 @@ function pillCls(res, eff) {
     return res.hasReasoning ? 'ok' : 'info';
   }
   if (res.http === 429) return 'warn';                    // rate-limited mid-probe: retest
-  if (res.related) return 'fail';                          // error body explicitly rejects this effort
-  return 'other';                                          // unrelated error (params/quota/...) — NOT evidence
+  return 'fail';                                          // 所有非 200 错误一律红显（不再灰色 other）
 }
 
 function renderModelCards(d) {
@@ -2197,7 +2321,8 @@ function renderModelCards(d) {
     const ids = modelsUI[pid];
     const folded = collapsedUI['models|' + pid] !== false;   // default: folded
     const job = allProbe[pid];
-    const jobActive = job && (job.running || (job.total > 0 && job.done < job.total && !job.error && job.done > 0));
+    const jst = job ? job.status : 'idle';
+    const jobActive = job && (jst === 'running' || jst === 'paused' || jst === 'stopping');
     // Disabled count must be computed for EVERY render path (head uses it)
     const offCount = Array.isArray(ids) ? ids.filter(m => p.disabledModels && p.disabledModels[m]).length : 0;
     let rows = '';
@@ -2210,12 +2335,13 @@ function renderModelCards(d) {
         const off = !!(d.providers[pid].disabledModels && d.providers[pid].disabledModels[mid]);
         // Job results (one-click test) take precedence over single-model probes
         const pr = (job && job.results && job.results[mid]) ? job.results[mid] : probeUI[key];
+        // 思考档位行默认直接展开；已测过的档按上次结果显示（一键测试结果优先，单测次之）
         let effRow = '';
-        if (pr) {
+        {
           let pills = '<span class="eff-pill idle" onclick="setOverride(\\\'' + pid + '\\\',\\\'' + mid + '\\\',null)" title="清除强制，跟随客户端">跟随客户端</span>';
           for (const eff of EFF) {
-            const res = (pr && pr.error) ? null : (pr ? pr[eff] : null);
-            let cls = 'idle', title = '';
+            const res = (pr && !pr.error) ? pr[eff] : null;
+            let cls = 'idle', title = '未测量 · 可点「测试」或一键测试';
             if (pr && pr.error) { cls = 'fail'; title = pr.error; }
             else if (res) {
               cls = pillCls(res, eff);
@@ -2243,7 +2369,16 @@ function renderModelCards(d) {
     } else {
       rows = '<div class="empty">点击「加载模型」拉取上游列表</div>';
     }
-    const jobTxt = job && job.total ? ' · 测试 ' + job.done + '/' + job.total + (job.current ? '（' + esc(job.current) + '）' : '') + (job.running ? '' : ' ✓') : '';
+    const stMap = { running: '测试中', paused: '已暂停', stopping: '停止中', stopped: '已停止', done: '测试完成' };
+    let jobTxt = '';
+    if (job && job.total) {
+      jobTxt = ' · ' + (stMap[job.status] || job.status) + ' ' + job.done + '/' + job.total + (job.current ? '（' + esc(job.current) + '）' : '');
+    }
+    let probeBtns = '';
+    if (jst === 'running') probeBtns = '<button class="btn sm" onclick="probeControl(\\\'' + pid + '\\\',\\\'pause\\\')">暂停</button>' + '<button class="btn danger sm" onclick="probeControl(\\\'' + pid + '\\\',\\\'stop\\\')">停止</button>';
+    else if (jst === 'paused') probeBtns = '<button class="btn sm" onclick="probeControl(\\\'' + pid + '\\\',\\\'resume\\\')">继续</button>' + '<button class="btn danger sm" onclick="probeControl(\\\'' + pid + '\\\',\\\'stop\\\')">停止</button>';
+    else if (jst === 'stopping') probeBtns = '<button class="btn sm" disabled title="正在中断剩余档位，稍候">停止中…</button>';
+    else probeBtns = '<button class="btn primary sm" onclick="probeAllStart(\\\'' + pid + '\\\')">一键测试</button>';
     html += '<div class="prov">' +
       '<div class="p-head">' +
         '<button class="fold-btn" onclick="toggleCollapse(\\\'models|' + pid + '\\\')" title="展开/收起模型列表">' + (folded ? '▸' : '▾') + '</button>' +
@@ -2251,10 +2386,11 @@ function renderModelCards(d) {
         (p.prefix ? '<span class="p-prefix">' + esc(p.prefix) + '</span>' : '') +
         '<span class="p-url">' + (Array.isArray(ids) ? ids.length + ' 个模型' + (offCount ? '（禁用 ' + offCount + '）' : '') : '') + '</span>' +
         '<span class="p-url">' + (Object.keys(ovs).length ? '已强制 ' + Object.keys(ovs).length : '') + '</span>' +
+        (jobTxt ? '<span class="p-url">' + jobTxt + '</span>' : '') +
         '<label class="chk sm" title="自动刷新该提供商模型列表（每 10 分钟）"><input type="checkbox" onchange="setProviderAuto(\\\'' + pid + '\\\',\\\'refresh\\\',this.checked)"' + (p.autoRefreshModels !== false ? ' checked' : '') + '>自动刷新</label>' +
         '<label class="chk sm" title="新模型自动测试思考强度并写入默认档位"><input type="checkbox" onchange="setProviderAuto(\\\'' + pid + '\\\',\\\'probe\\\',this.checked)"' + (p.autoProbeEffort !== false ? ' checked' : '') + '>自动测思考</label>' +
         '<span class="spacer"></span>' +
-        '<button class="btn primary sm" onclick="probeAllStart(\\\'' + pid + '\\\')"' + (jobActive ? ' disabled' : '') + '>' + (jobActive ? '测试中 ' + (job ? job.done + '/' + job.total : '') : '一键测试') + '</button>' +
+        probeBtns +
         '<button class="btn sm" onclick="loadModels(\\\'' + pid + '\\\',false)">加载模型</button>' +
         '<button class="btn sm" onclick="refreshModels(\\\'' + pid + '\\\')">强制刷新</button>' +
       '</div>' +
@@ -2369,7 +2505,13 @@ async function addKey(pid) {
   if (!key) return;
   const wi = document.getElementById('newweight-' + pid);
   const weight = wi ? parseInt(wi.value) : 1;
-  await fetch(API + '/api/keys/' + pid, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key, weight }) });
+  const r = await fetch(API + '/api/keys/' + pid, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key, weight }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) { showToast('添加失败: ' + (j.error || r.status), true); return; }
+  if (j.keyCheck) {
+    if (j.keyCheck.ok) showToast('密钥已添加 · 校验通过', false);
+    else showToast('密钥已添加，但校验失败（HTTP ' + (j.keyCheck.http || '-') + '）' + (j.keyCheck.msg ? '：' + j.keyCheck.msg.slice(0, 60) : ''), true);
+  }
   input.value = '';
   loadStatus();
 }
@@ -2463,6 +2605,12 @@ async function saveProvider() {
   const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.ok) { showToast('保存失败: ' + (j.error || r.status), true); return; }
   closeProviderModal();
+  if (j.keyCheck) {
+    if (j.keyCheck.ok) showToast('已保存 · 密钥校验通过（HTTP 200）', false);
+    else showToast('已保存，但密钥校验失败（HTTP ' + (j.keyCheck.http || '-') + '）' + (j.keyCheck.msg ? '：' + j.keyCheck.msg.slice(0, 60) : ''), true);
+  } else {
+    showToast('已保存', false);
+  }
   loadStatus();
 }
 

@@ -26,7 +26,8 @@
         "sensenova-6.7-flash-lite": "none",
         "sensenova-u1-fast": "none",
         "sensenova-u1.5-lite": "none",
-        "deepseek-v4-pro": "max"
+        "deepseek-v4-pro": "max",
+        "sensenova-u1.5-fast": "none"
       },
       "disabledModels": {
         "sensenova-6.7-flash-lite": true,
@@ -36,7 +37,7 @@
     },
     "workbuddygj": {
       "name": "workBuddyGJ",
-      "targetUrl": "http://127.0.0.1:8789",
+      "targetUrl": "http://127.0.0.1:8788",
       "prefix": "/wbgj",
       "keys": [
         {
@@ -89,11 +90,39 @@
         "glm-5.2": true,
         "kimi-k2.6": true
       }
+    },
+    "workbuddy": {
+      "name": "workbuddy",
+      "targetUrl": "http://127.0.0.1:7863",
+      "prefix": "/wb",
+      "keys": [
+        {
+          "key": "sk-bki-j3Lki7TyLJCH6Bv-mfj9",
+          "weight": 1
+        }
+      ],
+      "autoProbeEffort": false,
+      "disabledModels": {
+        "auto": true,
+        "hy3": true,
+        "hy3-x": true,
+        "glm-5.2": true,
+        "glm-5.1": true,
+        "glm-5v-turbo": true,
+        "kimi-k3-1": true,
+        "kimi-k2.8-preview": true,
+        "kimi-k2.7": true,
+        "kimi-k2.6": true,
+        "minimax-m3": true
+      },
+      "modelOverrides": {
+        "cn:deepseek-v4.1-flash": "max"
+      }
     }
   },
   "maxRetries": 20,
   "retryDelay": 0,
-  "requestTimeout": 60000,
+  "requestTimeout": 15000,
   "overallTimeout": 300000,
   "circuitBreaker": 999,
   "mode": "normal",
